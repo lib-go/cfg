@@ -1,187 +1,167 @@
-package cfg
+package go_cfg
 
 import (
 	"fmt"
-	"io/ioutil"
+	"github.com/stretchr/testify/assert"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-func newTmpFile(suffix string) (f *os.File) {
+func newTempFileName(format ConfigFormat) (name string) {
 	dir := os.TempDir()
-	name := filepath.Join(dir, fmt.Sprintf("%v.%v", time.Now().UnixNano(), suffix))
-	f, _ = os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	name = filepath.Join(dir, fmt.Sprintf("%v.%v", time.Now().UnixNano(), format))
+	_ = os.WriteFile(name, []byte{}, 0600)
 	return
 }
 
-func TestNonExistConfigFile(t *testing.T) {
-	filePath := fmt.Sprintf("/tmp/config_test.json")
-	if _, err := os.Stat(filePath); os.IsExist(err) {
-		os.Remove(filePath)
-	}
-
-	model := map[string]string{}
-	cfg, e := NewConfigStore(filePath, model)
-
-	if e == nil {
-		t.Error("should not accept non-ptr model")
-	}
-
-	cfg, e = NewConfigStore(filePath, &model)
-	if e != nil {
-		t.Error(e)
-	}
-	t.Log(cfg, e)
+func writeFile(name string, data string) {
+	_ = os.WriteFile(name, []byte(data), 0600)
 }
 
-func TestEmptyConfigFile(t *testing.T) {
-	f := newTmpFile("config.json")
-	defer f.Close()
-	t.Log("file", f.Name())
-
-	model := map[string]string{}
-	cfg, e := NewConfigStore(f.Name(), &model)
-	t.Log(cfg, e)
+func readFile(name string) string {
+	data, _ := os.ReadFile(name)
+	return string(data)
 }
 
-func TestPartialUpdate(t *testing.T) {
-	model := struct {
-		Hello string
-		List  []string
-	}{
-		"world",
+func TestConfigStore_Load_map(t *testing.T) {
+	model := map[string]string{}
+	fn := newTempFileName(FormatYAML)
+	t.Log(fn)
+	writeFile(fn, "hello: world")
+	cs, e := NewConfigStore(fn, &model)
+	assert.Nil(t, e)
+	assert.NotNil(t, cs)
+	assert.Equal(t, map[string]string{"hello": "world"}, model)
+
+	// 修改配置文件，重新载入可以使用新的值
+	writeFile(fn, "hello: world2")
+	_ = cs.Load()
+	assert.Equal(t, map[string]string{"hello": "world2"}, model)
+}
+
+type testModel struct {
+	Hello string
+	List  []string
+}
+
+func TestConfigStore_Load_struct(t *testing.T) {
+	model := testModel{
+		"default",
 		[]string{"1"},
 	}
 
-	// 更新的配置会载入进来
-	f := newTmpFile("config.json")
-	f.WriteString(`{"list": ["1", "2"]}`)
-	f.Close()
+	fn := newTempFileName(FormatYAML)
+	writeFile(fn, "hello: world1")
+	cs, e := NewConfigStore(fn, &model)
+	assert.Nil(t, e)
+	assert.NotNil(t, cs)
+	assert.Equal(t, "world1", model.Hello)
+	//pretty.Println(model)
 
-	cfg, e := NewConfigStore(f.Name(), &model)
+	// 修改配置文件，重新载入可以使用新的值
 
-	fmt.Println("new", cfg, e)
-	if e != nil {
-		t.Error(0)
-	}
-	if !(len(model.List) == 2 && model.Hello == "world") {
-		t.Error(1, model)
-	}
-	t.Log(model)
+	writeFile(fn, "hello: world2")
+	_ = cs.Load()
+	assert.Equal(t, "world2", model.Hello)
+	assert.Equal(t, []string{"1"}, model.List, "配置文件没有提供的值，不会覆盖原有值")
 
-	// 不存在的配置会恢复为默认值
-	ioutil.WriteFile(f.Name(), []byte("{}"), 0644)
-	t.Log("cfg", cfg.modelPtr)
-	cfg.SetAutoReload(true)
-	time.Sleep(time.Second + time.Millisecond)
-	if !(len(model.List) == 1 && model.Hello == "world") {
-		t.Error(2)
-	}
-
-	t.Log(cfg, e, model)
+	// 修改配置文件，重新载入可以使用新的值
+	writeFile(fn, "list: [\"1\", \"2\"]")
+	_ = cs.Load()
+	assert.Equal(t, "default", model.Hello, "配置文件没有提供的值，不会覆盖原有值")
+	assert.Equal(t, []string{"1", "2"}, model.List, "配置文件提供的值，会覆盖原有值")
 }
 
-func TestLoad(t *testing.T) {
-	f := newTmpFile("config.json")
-	defer f.Close()
-	f.WriteString(`{"hello": "world"}`)
+func TestConfigStore_Save(t *testing.T) {
+	model := testModel{
+		"default",
+		[]string{"1"},
+	}
 
-	m := map[string]string{}
-	c, e := NewConfigStore(f.Name(), &m)
-	t.Log(c, e)
-	t.Log(c.Model())
+	fn := newTempFileName(FormatYAML)
+	cs, e := NewConfigStore(fn, &model)
+	assert.Nil(t, e)
+	_ = cs.Save()
+
+	text := readFile(fn)
+	assert.Equal(t, "hello: default\nlist:\n    - \"1\"\n", text)
+	//pretty.Println(string(data))
 }
 
-func TestAutoReloadAndOnChange(t *testing.T) {
-	f := newTmpFile("config.json")
-	t.Log(f.Name())
-	f.WriteString(`{"hello": "world"}`)
-	f.Close()
+func TestConfigStore_Watch(t *testing.T) {
+	model := testModel{
+		"default",
+		[]string{"1"},
+	}
 
-	model := map[string]string{}
-	c, e := NewConfigStore(f.Name(), &model)
-	c.SetAutoReload(true)
-	t.Log("loaded", c.Model(), e)
+	fn := newTempFileName(FormatYAML)
+	cs, _ := NewConfigStore(fn, &model)
 
-	changed := false
-	c.AfterChange(func() {
-		t.Log("changed", model)
-
-		if c.Model() != &model {
-			t.Error(2)
+	initUpdated := false
+	fileChanged := false
+	ch := make(chan bool, 1)
+	cs.Watch(func(changed bool) {
+		if changed {
+			fileChanged = true
+			ch <- true
+		} else {
+			initUpdated = true
 		}
-		if model["hello"] != "world2" {
-			t.Error(3)
+	}, true)
+	assert.True(t, initUpdated)
+	assert.False(t, fileChanged)
+
+	// 修改配置文件，重新载入可以使用新的值
+	writeFile(fn, "hello: world")
+	select {
+	case <-ch:
+		assert.True(t, fileChanged)
+	case <-time.After(time.Second):
+		assert.Fail(t, "timeout")
+	}
+
+	// StopWatch后，修改配置文件，就不会进入onUpdate函数
+	cs.StopWatch()
+	writeFile(fn, "hello: world")
+	select {
+	case <-ch:
+		assert.Fail(t, "不应该发送事件")
+	case <-time.After(time.Second * 2):
+		t.Log("超时是对的")
+	}
+}
+
+func TestMustBindConfig(t *testing.T) {
+	model := testModel{
+		"default",
+		[]string{"1"},
+	}
+
+	fn := newTempFileName(FormatYAML)
+
+	initUpdated := false
+	fileChanged := false
+	ch := make(chan bool, 1)
+
+	MustBindConfig(fn, &model, func(changed bool) {
+		if changed {
+			fileChanged = true
+			ch <- true
+		} else {
+			initUpdated = true
 		}
-		changed = true
-	}, false)
+	})
+	assert.True(t, initUpdated)
+	assert.False(t, fileChanged)
 
-	ioutil.WriteFile(f.Name(), []byte(`{"hello": "world2"}`), 0644)
-
-	time.Sleep(time.Second * 1)
-	if !changed {
-		t.Error(1)
+	// 修改配置文件，重新载入可以使用新的值
+	writeFile(fn, "hello: world")
+	select {
+	case <-ch:
+		assert.True(t, fileChanged)
+	case <-time.After(time.Second):
+		assert.Fail(t, "timeout")
 	}
-}
-
-func TestStructModel(t *testing.T) {
-	f := newTmpFile("config.json")
-	t.Log(f.Name())
-	f.WriteString(`{"hello": "world"}`)
-	f.Close()
-
-	model := struct {
-		Hello string
-	}{}
-
-	c, e := NewConfigStore(f.Name(), &model)
-	t.Log("loaded", c.Model(), e)
-
-	if model.Hello != "world" {
-		t.Error(1)
-	}
-}
-
-func TestSave(t *testing.T) {
-	f := newTmpFile("config.json")
-	t.Log(f.Name())
-	f.WriteString(`{"hello": "world"}`)
-	f.Close()
-
-	model := struct {
-		Hello string
-		List  []string
-	}{
-		Hello: "world",
-		List:  []string{"a.com", "b.com"},
-	}
-
-	c, e := NewConfigStore(f.Name(), &model)
-	c.Save()
-
-	blob, e := ioutil.ReadFile(f.Name())
-	t.Log(string(blob), e)
-}
-
-func TestYAML(t *testing.T) {
-	f := newTmpFile("config.yaml")
-	f.WriteString(`port: 8888
-cert: ""`)
-
-	model := struct {
-		Port int
-		Cert string
-	}{
-		9999,
-		"",
-	}
-
-	c, e := NewConfigStore(f.Name(), &model)
-	t.Log(c, e)
-	if e != nil || model.Port != 8888 {
-		t.Fail()
-	}
-
 }

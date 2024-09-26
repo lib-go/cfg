@@ -1,10 +1,12 @@
-package cfg
+package go_cfg
 
 import (
 	"encoding/json"
 	"fmt"
-	"gopkg.in/yaml.v2"
-	"io/ioutil"
+	"gopkg.in/yaml.v3"
+	"io"
+	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,14 +14,25 @@ import (
 	"time"
 )
 
+type ConfigFormat string
+
+const (
+	FormatJSON ConfigFormat = "json"
+	FormatYAML ConfigFormat = "yaml"
+)
+
+type OnUpdateFunc func(changed bool)
+
 type ConfigStore struct {
-	path             string
-	fileInfo         os.FileInfo
-	enableAutoReload bool
-	modelPtr         interface{} // pointer to model
-	defaultData      []byte
-	afterChange      func()
-	format           string
+	path        string
+	modelPtr    interface{} // pointer to model
+	format      ConfigFormat
+	defaultData []byte // 初始化时modelPtr的初始值，作为文件中missing的值的fallback
+
+	isWatching bool
+	onUpdate   OnUpdateFunc
+
+	fileInfo os.FileInfo
 }
 
 func NewConfigStore(path string, modelPtr interface{}) (c *ConfigStore, e error) {
@@ -28,11 +41,23 @@ func NewConfigStore(path string, modelPtr interface{}) (c *ConfigStore, e error)
 		e = fmt.Errorf("modelPtr must be pointer")
 		return
 	}
+
 	c = &ConfigStore{
 		path:     path,
 		modelPtr: modelPtr,
 	}
-	c.defaultData, e = dumps(c.Format(), c.modelPtr)
+
+	ext := strings.Replace(strings.ToLower(filepath.Ext(c.path)), ".", "", 1)
+	switch ext {
+	case "json":
+		c.format = FormatJSON
+	case "yaml":
+		c.format = FormatYAML
+	default:
+		return nil, fmt.Errorf("unknown format: %s", ext)
+	}
+
+	c.defaultData, e = dumps(c.format, c.modelPtr)
 
 	if e = c.Load(); e != nil {
 		return nil, e
@@ -41,24 +66,21 @@ func NewConfigStore(path string, modelPtr interface{}) (c *ConfigStore, e error)
 	return
 }
 
-func MustBindConfig(path string, modelPtr interface{}, onChange func()) (c *ConfigStore) {
+func MustBindConfig(path string, modelPtr interface{}, onUpdate OnUpdateFunc) (c *ConfigStore) {
 	var e error
 	if c, e = NewConfigStore(path, modelPtr); e != nil {
 		panic(e)
 	}
-
-	if onChange != nil {
-		c.SetAutoReload(true)
-		c.AfterChange(onChange, true)
-	}
+	c.Watch(onUpdate, true)
 	return c
 }
 
-func (c *ConfigStore) Format() string {
-	if c.format == "" {
-		c.format = strings.Replace(strings.ToLower(filepath.Ext(c.path)), ".", "", 1)
-	}
+func (c *ConfigStore) Format() ConfigFormat {
 	return c.format
+}
+
+func (c *ConfigStore) Model() interface{} {
+	return c.modelPtr
 }
 
 func (c *ConfigStore) String() string {
@@ -66,28 +88,24 @@ func (c *ConfigStore) String() string {
 }
 
 func (c *ConfigStore) Load() (e error) {
+	var fileInfo os.FileInfo
 	var file *os.File
+	var blob []byte
 
-	if _, err := os.Stat(c.path); os.IsNotExist(err) {
-		file, e = os.Create(c.path)
-	} else {
-		file, e = os.Open(c.path)
+	if fileInfo, e = os.Stat(c.path); os.IsNotExist(e) {
+		return fs.ErrNotExist
 	}
-	defer file.Close()
-
-	if e != nil {
+	if file, e = os.Open(c.path); e != nil {
+		return
+	}
+	if blob, e = io.ReadAll(file); e != nil {
 		return
 	}
 
-	blob, e := ioutil.ReadAll(file)
-	if e != nil {
-		return
-	}
+	c.fileInfo = fileInfo
 
-	info, _ := os.Stat(c.path)
-	c.fileInfo = info
-
-	e = loads(c.Format(), c.defaultData, c.modelPtr) // 配置变更以后,missing key应该恢复为默认值
+	// 配置变更以后,missing key应该恢复为初始值
+	e = loads(c.Format(), c.defaultData, c.modelPtr)
 	if len(blob) != 0 {
 		e = loads(c.Format(), blob, c.modelPtr)
 	}
@@ -95,62 +113,58 @@ func (c *ConfigStore) Load() (e error) {
 	return
 }
 
-func (c *ConfigStore) SetAutoReload(enabled bool) {
-	if c.enableAutoReload == false && enabled == true {
-		go c.startAutoReloading()
+func (c *ConfigStore) Save() (e error) {
+	var output []byte
+	if output, e = dumps(c.Format(), c.modelPtr); e != nil {
+		return
 	}
-	c.enableAutoReload = enabled
+	return os.WriteFile(c.path, output, 0644)
 }
 
-func (c *ConfigStore) AfterChange(afterChange func(), applyNow bool) {
-	c.afterChange = afterChange
-	if afterChange != nil {
-		c.SetAutoReload(true)
+func (c *ConfigStore) Watch(fn OnUpdateFunc, callUpdateNow bool) {
+	c.onUpdate = fn
+	if callUpdateNow && fn != nil {
+		fn(false)
+	}
 
-		if applyNow {
-			afterChange()
+	if !c.isWatching {
+		c.isWatching = true
+		go c.startWatching()
+	}
+}
+
+func (c *ConfigStore) isConfigFileChanged() (changed bool) {
+	info, err := os.Stat(c.path)
+	if err == nil {
+		if info.ModTime() != c.fileInfo.ModTime() || info.Size() != c.fileInfo.Size() {
+			return true
 		}
 	}
+	return false
 }
 
-func (c *ConfigStore) startAutoReloading() {
+func (c *ConfigStore) startWatching() {
 	for {
-		if !c.enableAutoReload {
+		if !c.isWatching {
 			return
 		}
-		info, err := os.Stat(c.path)
 
-		if err == nil {
-			if info.ModTime() != c.fileInfo.ModTime() || info.Size() != c.fileInfo.Size() {
-				c.Load()
-				c.EmitChange()
+		if c.isConfigFileChanged() {
+			if e := c.Load(); e != nil {
+				log.Println("config file changed, but load failed:", e)
+			} else if c.onUpdate != nil {
+				c.onUpdate(true)
 			}
 		}
 		time.Sleep(1 * time.Second)
 	}
 }
 
-func (c *ConfigStore) EmitChange() {
-	if c.afterChange != nil {
-		c.afterChange()
-	}
+func (c *ConfigStore) StopWatch() {
+	c.isWatching = false
 }
 
-func (c *ConfigStore) Model() interface{} {
-	return c.modelPtr
-}
-
-func (c *ConfigStore) Save() (e error) {
-	var output []byte
-	output, e = dumps(c.Format(), c.modelPtr)
-	if e != nil {
-		return e
-	}
-	e = ioutil.WriteFile(c.path, output, 0644)
-	return e
-}
-
-func loads(format string, chunk []byte, v interface{}) (e error) {
+func loads(format ConfigFormat, chunk []byte, v interface{}) (e error) {
 	switch format {
 	case "json":
 		e = json.Unmarshal(chunk, v)
@@ -162,7 +176,7 @@ func loads(format string, chunk []byte, v interface{}) (e error) {
 	return
 }
 
-func dumps(format string, in interface{}) (output []byte, e error) {
+func dumps(format ConfigFormat, in interface{}) (output []byte, e error) {
 	switch format {
 	case "json":
 		output, e = json.MarshalIndent(in, " ", "  ")

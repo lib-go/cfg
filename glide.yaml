@@ -1,3 +1,0 @@
-package: github.com/lib-go/cfg
-import:
-- package: gopkg.in/yaml.v2
