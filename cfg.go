@@ -1,4 +1,4 @@
-package go_cfg
+package cfg
 
 import (
 	"encoding/json"
