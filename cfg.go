@@ -3,7 +3,7 @@ package cfg
 import (
 	"encoding/json"
 	"fmt"
-	"gopkg.in/yaml.v3"
+	"gopkg.in/yaml.v2"
 	"io"
 	"io/fs"
 	"log"
